@@ -1,0 +1,433 @@
+# hx_tcu_app.py
+# Double-Pipe HX + TCU (Chiller for Cooling, Heater for Heating) — HTF naming, dynamic time-to-SP
+# Streamlit app version with synced sliders + type-in fields (no session-state warnings)
+
+import math
+import streamlit as st
+
+# ---------------- Page setup ----------------
+st.set_page_config(page_title="Double-Pipe HX + TCU (HTF) — Interactive", layout="wide")
+
+# ---------- Pipe data (ASME B36.10 Sch 40); dimensions in meters ----------
+PIPES_SCH40 = {
+    '1.5"': {'OD': 0.0483, 'ID': 0.0409},
+    '2"':   {'OD': 0.0603, 'ID': 0.0525},
+    '2.5"': {'OD': 0.0730, 'ID': 0.0627},
+    '3"':   {'OD': 0.0889, 'ID': 0.0779},
+    '4"':   {'OD': 0.1143, 'ID': 0.1023},
+}
+
+# ---------- Wall thermal conductivities (W/m·K) ----------
+WALL_K = {
+    'Stainless steel': 16.0,
+    'Carbon steel':   45.0,
+    'Copper':        385.0,
+}
+
+# ---------- Water-like properties (~25–30 °C, edit if needed) ----------
+rho = 997.0       # kg/m^3
+cp  = 4180.0      # J/kg/K
+mu  = 0.00089     # Pa·s
+k   = 0.60        # W/m/K
+Pr  = cp * mu / k
+
+# ---------- correlations & helpers ----------
+def d_belt_nusselt(Re, Pr, heating=True):
+    n = 0.4 if heating else 0.3
+    return 0.023 * (Re**0.8) * (Pr**n)
+
+def laminar_nusselt_circular():
+    return 3.66
+
+def annulus_area_id(Do_shell_ID, Do_inner_OD):
+    A = (math.pi/4.0) * (Do_shell_ID**2 - Do_inner_OD**2)
+    Dh = Do_shell_ID - Do_inner_OD
+    return A, Dh
+
+def lmtd(dt1, dt2):
+    if dt1 <= 0 or dt2 <= 0:
+        return float('nan')
+    if abs(dt2 - dt1) < 1e-9:
+        return dt1
+    return (dt2 - dt1) / math.log(dt2 / dt1)
+
+def eff_counter_current(NTU, Cr):
+    if abs(1.0 - Cr) < 1e-9:
+        return NTU / (1.0 + NTU)
+    return (1.0 - math.exp(-NTU * (1.0 - Cr))) / (1.0 - Cr * math.exp(-NTU * (1.0 - Cr)))
+
+def hx_q_from_ua(UA, Th_in, Tc_in, Ch_hot, Cc_cold):
+    if UA <= 0 or Ch_hot <= 0 or Cc_cold <= 0:
+        return 0.0, Th_in, Tc_in, 0.0, 0.0, 0.0
+    Cmin = min(Ch_hot, Cc_cold); Cmax = max(Ch_hot, Cc_cold)
+    Cr = Cmin / Cmax
+    NTU = UA / Cmin
+    eps = eff_counter_current(NTU, Cr)
+    Qmax = Cmin * max(0.0, (Th_in - Tc_in))
+    Q = eps * Qmax
+    Th_out = Th_in - Q / Ch_hot
+    Tc_out = Tc_in + Q / Cc_cold
+    return Q, Th_out, Tc_out, eps, NTU, Cr
+
+def hx_q_to_process(UA, T_proc_in, T_htf_supply_in, Ch_proc, Cc_htf):
+    # positive heats the process, negative cools the process
+    if UA <= 0: return 0.0
+    if T_proc_in >= T_htf_supply_in:
+        Q, *_ = hx_q_from_ua(UA, Th_in=T_proc_in, Tc_in=T_htf_supply_in,
+                             Ch_hot=Ch_proc, Cc_cold=Cc_htf)
+        return -Q
+    else:
+        Q, *_ = hx_q_from_ua(UA, Th_in=T_htf_supply_in, Tc_in=T_proc_in,
+                             Ch_hot=Cc_htf, Cc_cold=Ch_proc)
+        return +Q
+
+def htf_return_temp(UA, T_proc_in, T_htf_supply_in, Ch_proc, Cc_htf):
+    if UA <= 0: return T_htf_supply_in
+    if T_proc_in >= T_htf_supply_in:
+        Q, Th_out, Tc_out, *_ = hx_q_from_ua(UA, Th_in=T_proc_in, Tc_in=T_htf_supply_in,
+                                             Ch_hot=Ch_proc, Cc_cold=Cc_htf)
+        return Tc_out
+    else:
+        Q, Th_out, Tc_out, *_ = hx_q_from_ua(UA, Th_in=T_htf_supply_in, Tc_in=T_proc_in,
+                                             Ch_hot=Cc_htf, Cc_cold=Ch_proc)
+        return Th_out
+
+def solve_htf_supply_with_heater_limit(UA, T_proc_in, Ch_proc, Cc_htf, heater_max_W,
+                                       lower_guess, upper_target):
+    # find highest supply ≤ target that heater can sustain: Cc*(Ts - Tr(Ts)) = heater_max
+    if Cc_htf <= 0: return lower_guess
+    def f(Ts):
+        Tr = htf_return_temp(UA, T_proc_in, Ts, Ch_proc, Cc_htf)
+        req = max(0.0, Cc_htf * (Ts - Tr))
+        return req - max(0.0, heater_max_W)
+    lo = float(lower_guess); hi = float(upper_target)
+    if f(hi) <= 0: return hi
+    if f(lo) > 0:  return lo
+    for _ in range(48):
+        mid = 0.5*(lo+hi)
+        (lo,hi) = (mid,hi) if f(mid) <= 0 else (lo,mid)
+        if abs(hi-lo) < 1e-3: break
+    return lo
+
+# ---------- dynamic time-to-setpoint (new) ----------
+def simulate_time_to_sp(T0, Tsp, UA, Ch_proc, Cc_htf, Q_machines_W,
+                        chiller_sp_c, heater_max_W, htf_target_supply_c,
+                        m_process, dt_s=0.5, max_hours=24.0):
+    """
+    integrate dT/dt = (Q_machines + Q_HX(T)) / (m*cp) with mode switching.
+    - cooling: HTF supply = chiller_sp_c (heater off)
+    - heating: heater raises HTF up to target, capped by heater_max_W
+    returns (t_sec, reached_bool, avg_net_W)
+    """
+    T = float(T0)
+    t = 0.0
+    E_net = 0.0  # integrate net power for average
+    max_t = max_hours*3600.0
+    mcp = m_process * cp
+    if mcp <= 0: return float('inf'), False, 0.0
+
+    # direction to target
+    need_sign = 1.0 if (T0 < Tsp) else -1.0
+    tol = 0.05  # °C tolerance to declare "at setpoint"
+
+    while t < max_t:
+        mode = "HEATING" if (T < Tsp) else "COOLING"
+
+        if mode == "COOLING":
+            T_htf_supply = chiller_sp_c
+        else:
+            # recompute heater-limited supply each step (depends on return, which depends on current T)
+            T_low  = min(T, htf_target_supply_c)
+            T_high = max(T, htf_target_supply_c)
+            T_htf_supply = solve_htf_supply_with_heater_limit(
+                UA, T, Ch_proc, Cc_htf, heater_max_W, T_low, T_high
+            )
+
+        Q_hx = hx_q_to_process(UA, T, T_htf_supply, Ch_proc, Cc_htf)
+        Q_net = Q_machines_W + Q_hx
+        E_net += Q_net * dt_s
+
+        # forward-euler step
+        dT = (Q_net / mcp) * dt_s
+        # cap step to keep stable when far from SP
+        if abs(dT) > 0.25:
+            dt_s_eff = 0.25 * dt_s / max(1e-9, abs(dT))
+            dT = (Q_net / mcp) * dt_s_eff
+            t += dt_s_eff
+        else:
+            t += dt_s
+        T += dT
+
+        # stop when we cross or get within tolerance in the right direction
+        if (need_sign > 0 and T >= Tsp - tol) or (need_sign < 0 and T <= Tsp + tol):
+            break
+
+        # abort if moving the wrong way
+        if Q_net * need_sign <= 0 and abs(T - Tsp) > 0.5:
+            # no net push toward SP → unreachable with current settings
+            return float('inf'), False, E_net / max(t, 1e-9)
+
+    return t, (t < max_t), E_net / max(t, 1e-9)
+
+# ---------- main compute ----------
+def compute(
+    # machine heat
+    n_machines, heat_per_machine_kw, override_total_kw,
+    # geometry
+    inner_size, outer_size,
+    # flows
+    proc_flow_lph, htf_flow_lph,
+    # process temps (current & setpoint) and inventory
+    proc_current_c, proc_setpoint_c, loop_volume_l,
+    # cooling path (chiller)
+    chiller_sp_c,
+    # heating path (TCU heater)
+    heater_max_kw, htf_target_supply_c,
+    # materials/fouling/margin
+    wall_mat, fouling_inner, fouling_outer, length_margin
+):
+    # ---- machine duty ----
+    Q_machines_kw = n_machines * heat_per_machine_kw
+    Q_design_kw = override_total_kw if override_total_kw > 0 else Q_machines_kw
+    Q_design_W = Q_design_kw * 1000.0
+    Q_machines_W = Q_machines_kw * 1000.0
+
+    # ---- geometry ----
+    inner = PIPES_SCH40[inner_size]; outer = PIPES_SCH40[outer_size]
+    Di, Do = inner['ID'], inner['OD']; Do_shell_ID = outer['ID']
+    if Do_shell_ID <= Do:
+        return None, ["ERROR: Outer pipe ID must exceed inner OD. Choose a larger outer NPS."]
+    Ai = math.pi * (Di**2) / 4.0
+    Ao_per_m = math.pi * Do
+    Aa, Dh = annulus_area_id(Do_shell_ID, Do)
+
+    # ---- flows & capacity rates ----
+    # process
+    qp_m3s = proc_flow_lph / 3600.0 / 1000.0
+    mdot_p = rho * qp_m3s
+    vp = qp_m3s / Ai
+    Ch_proc = mdot_p * cp
+
+    # HTF
+    qh_m3s = htf_flow_lph / 3600.0 / 1000.0
+    mdot_htf = rho * qh_m3s
+    vh = qh_m3s / Aa
+    Cc_htf = mdot_htf * cp
+
+    # ---- films ----
+    Re_p = rho * vp * Di / mu
+    Nu_p = d_belt_nusselt(Re_p, Pr, heating=False) if Re_p >= 2300 else laminar_nusselt_circular()
+    h_i = Nu_p * k / Di
+
+    Re_h = rho * vh * Dh / mu
+    Nu_h = d_belt_nusselt(Re_h, Pr, heating=True) if Re_h >= 2300 else laminar_nusselt_circular()
+    h_o = Nu_h * k / Dh
+
+    # ---- overall U (outer-area basis) ----
+    k_wall = WALL_K[wall_mat]
+    R_i  = (Do / (Di * h_i))
+    R_w  = (Do * math.log(Do / Di)) / (2.0 * k_wall)
+    R_fi = fouling_inner
+    R_fo = fouling_outer
+    R_o  = 1.0 / h_o
+    Uo = 1.0 / (R_i + R_w + R_fi + R_fo + R_o)
+
+    # ---- size HX for cooling at setpoint with chiller SP ----
+    Th_in = proc_setpoint_c
+    dTp = Q_design_W / max(1e-9, Ch_proc)
+    Th_out = Th_in - dTp
+
+    T_htf_in_cold = chiller_sp_c
+    dTh = Q_design_W / max(1e-9, Cc_htf)
+    T_htf_out_cold = T_htf_in_cold + dTh
+
+    DT1 = Th_in  - T_htf_out_cold
+    DT2 = Th_out - T_htf_in_cold
+    DTlm = lmtd(DT1, DT2)
+
+    A_req = Q_design_W / (Uo * DTlm) if DTlm > 0 else float('nan')
+    L_req = A_req / Ao_per_m if A_req == A_req else float('nan')
+    L_req_m = L_req * (1.0 + length_margin) if L_req == L_req else float('nan')
+    V_annulus = Aa * L_req_m if L_req_m == L_req_m else float('nan')
+    UA_installed = Uo * Ao_per_m * L_req_m if L_req_m == L_req_m else 0.0
+
+    # ---- dynamic time-to-SP (new) ----
+    M_loop = rho * (loop_volume_l / 1000.0)  # kg
+    heater_max_W = max(0.0, heater_max_kw * 1000.0)
+    t_sec, reached, Qnet_avg = simulate_time_to_sp(
+        proc_current_c, proc_setpoint_c, UA_installed, Ch_proc, Cc_htf,
+        Q_machines_W, chiller_sp_c, heater_max_W, htf_target_supply_c,
+        M_loop, dt_s=0.5, max_hours=24.0
+    )
+
+    # ---- mode & instantaneous displays (for context) ----
+    mode_now = "HEATING" if (proc_current_c < proc_setpoint_c) else "COOLING"
+    if mode_now == "COOLING":
+        T_htf_supply_eff = chiller_sp_c
+        heater_use_W = 0.0
+    else:
+        lb = min(proc_current_c, htf_target_supply_c)
+        ub = max(proc_current_c, htf_target_supply_c)
+        T_htf_supply_eff = solve_htf_supply_with_heater_limit(
+            UA_installed, proc_current_c, Ch_proc, Cc_htf, heater_max_W, lb, ub
+        )
+        Tr = htf_return_temp(UA_installed, proc_current_c, T_htf_supply_eff, Ch_proc, Cc_htf)
+        heater_use_W = max(0.0, Cc_htf * (T_htf_supply_eff - Tr))
+        heater_use_W = min(heater_use_W, heater_max_W)
+
+    Q_hx_now_W = hx_q_to_process(UA_installed, proc_current_c, T_htf_supply_eff, Ch_proc, Cc_htf)
+
+    # ---- notes ----
+    notes = []
+    if Re_p < 4000: notes.append(f"Process Re = {Re_p:,.0f} (transitional/laminar) → lower h_i; expect longer length.")
+    if Re_h < 4000: notes.append(f"HTF annulus Re = {Re_h:,.0f} (transitional/laminar) → lower h_o; consider more HTF flow.")
+    if DTlm != DTlm: notes.append("LMTD non-physical for sizing; check chiller SP vs process SP.")
+    if mode_now == "HEATING" and abs(heater_use_W - heater_max_W) < 1e-6:
+        notes.append("Heater at limit now; supply may be below target.")
+    if UA_installed <= 0: notes.append("Installed UA is zero/NaN (sizing invalid).")
+    if not reached: notes.append("With current settings the loop cannot converge to SP (net power pushes the wrong way or is ~zero).")
+
+    # ---- helpers ----
+    def fmt_time(s):
+        if s == float('inf') or s != s: return "n/a"
+        m, s = divmod(int(round(s)), 60); h, m = divmod(m, 60)
+        return f"{h:d}h {m:02d}m {s:02d}s" if h else f"{m:02d}m {s:02d}s"
+
+    # ---- report ----
+    html = f"""
+    <div style="font-family:ui-monospace,Consolas,monospace; line-height:1.35">
+    <b>Inputs</b><br>
+    • Machines: {n_machines} × {heat_per_machine_kw:.2f} kW (override={override_total_kw:.2f} kW) → Design Q = {Q_design_kw:.2f} kW<br>
+    • Process flow = {proc_flow_lph:,.0f} L/h • HTF flow (annulus) = {htf_flow_lph:,.0f} L/h<br>
+    • Process now = {proc_current_c:.2f} °C • Process SP = {proc_setpoint_c:.2f} °C • Loop volume (process) = {loop_volume_l:.1f} L<br>
+    • Chiller SP (cooling) = {chiller_sp_c:.2f} °C • Heater max = {heater_max_kw:.2f} kW • HTF target supply = {htf_target_supply_c:.2f} °C<br>
+    • Inner pipe = {inner_size} (ID={PIPES_SCH40[inner_size]['ID']*1e3:.1f} mm, OD={PIPES_SCH40[inner_size]['OD']*1e3:.1f} mm)
+      • Outer (shell) = {outer_size} (ID={PIPES_SCH40[outer_size]['ID']*1e3:.1f} mm)<br>
+    • Wall = {wall_mat} (k={WALL_K[wall_mat]:.1f} W/mK) • Fouling inner={fouling_inner:.1e} outer={fouling_outer:.1e} m²K/W • Length margin = {length_margin*100:.0f}%<br><br>
+
+    <b>Cooling HX sizing @ SP (chiller SP as cold inlet)</b><br>
+    • LMTD = {DTlm:.3f} K  (ΔT1={DT1:.3f}, ΔT2={DT2:.3f}) • U_o={Uo:,.0f} W/m²K<br>
+    • Area A = {A_req:.3f} m² • Length L = {L_req:.2f} m → with margin = <b>{L_req_m:.2f} m</b><br>
+    • Annulus hold-up ≈ {V_annulus*1e3 if V_annulus==V_annulus else float('nan'):.1f} L • Installed UA ≈ {UA_installed/1000.0:.2f} kW/K<br><br>
+
+    <b>Now</b><br>
+    • Mode = <b>{'HEATING' if proc_current_c < proc_setpoint_c else 'COOLING'}</b> • HTF supply = {T_htf_supply_eff:.2f} °C • Heater use ≈ {heater_use_W/1000.0:.2f} kW<br>
+    • HX heat to process now ≈ {Q_hx_now_W/1000.0:.2f} kW (sign + heats / − cools)<br><br>
+
+    <b>Dynamic time to SP (this fix)</b><br>
+    • Estimated time = <b>{fmt_time(t_sec)}</b> • Avg net to process ≈ {Qnet_avg/1000.0:.2f} kW (sign + heats / − cools)<br>
+    </div>
+    """
+    return html, notes
+
+# ---------------- Streamlit helpers: synced number + slider ----------------
+def _sync_from_num(key): st.session_state[f"{key}_sld"] = st.session_state[f"{key}_num"]
+def _sync_from_sld(key): st.session_state[f"{key}_num"] = st.session_state[f"{key}_sld"]
+
+def dual_float(label, key, min_value, max_value, default, step, fmt=None, help=None):
+    # initialize once
+    if f"{key}_num" not in st.session_state:
+        st.session_state[f"{key}_num"] = float(default)
+        st.session_state[f"{key}_sld"] = float(default)
+    c1, c2 = st.columns([1,2], gap="small")
+    with c1:
+        st.number_input(label,
+                        min_value=float(min_value), max_value=float(max_value),
+                        step=float(step), format=fmt or None,
+                        key=f"{key}_num", help=help,
+                        on_change=_sync_from_num, args=(key,))
+    with c2:
+        st.slider(" ",
+                  min_value=float(min_value), max_value=float(max_value),
+                  step=float(step),
+                  key=f"{key}_sld",
+                  on_change=_sync_from_sld, args=(key,))
+    return float(st.session_state[f"{key}_num"])
+
+def dual_int(label, key, min_value, max_value, default, step=1, help=None):
+    if f"{key}_num" not in st.session_state:
+        st.session_state[f"{key}_num"] = int(default)
+        st.session_state[f"{key}_sld"] = int(default)
+    c1, c2 = st.columns([1,2], gap="small")
+    with c1:
+        st.number_input(label,
+                        min_value=int(min_value), max_value=int(max_value),
+                        step=int(step),
+                        key=f"{key}_num", help=help,
+                        on_change=_sync_from_num, args=(key,))
+    with c2:
+        st.slider(" ",
+                  min_value=int(min_value), max_value=int(max_value),
+                  step=int(step),
+                  key=f"{key}_sld",
+                  on_change=_sync_from_sld, args=(key,))
+    return int(st.session_state[f"{key}_num"])
+
+# ---------------- UI ----------------
+st.markdown("### Double-Pipe HX with TCU (Chiller for Cooling, Heater for Heating) — HTF")
+
+with st.expander("Notes on assumptions", expanded=False):
+    st.markdown(
+        "- Fouling adds to total thermal resistance; set 0 for 'ideal'.\n"
+        "- Heating if current < setpoint; cooling if current > setpoint.\n"
+        "- Cooling capacity limits HX sizing; heater limited by Max kW.\n"
+        "- Time-to-SP integrates net duty over total loop volume."
+    )
+
+col1, col2, col3 = st.columns(3, gap="large")
+
+with col1:
+    st.subheader("Machine heat")
+    n_machines = dual_int("# Mills", "mills", 0, 20, 6, 1)
+    heat_per_machine_kw = dual_float("kW per Mill", "kw_per", 0.00, 2.00, 0.33, 0.01, fmt="%.2f")
+    override_total_kw   = dual_float("Override Total kW", "kw_override", 0.0, 20.0, 0.0, 0.1, fmt="%.1f")
+
+    st.subheader("Geometry")
+    inner_size = st.selectbox("Inner NPS", list(PIPES_SCH40.keys()), index=1)
+    outer_size = st.selectbox("Outer NPS", list(PIPES_SCH40.keys()), index=3)
+
+    st.subheader("Flows")
+    proc_flow_lph = dual_int("Process L/h", "proc_lph", 200, 30000, 3420, 10)
+    htf_flow_lph  = dual_int("HTF L/h (annulus)", "htf_lph", 200, 30000, 2500, 10)
+
+with col2:
+    st.subheader("Process temps & inventory")
+    proc_current_c   = dual_float("Process Current °C", "t_now", -10.0, 90.0, 26.0, 0.1, fmt="%.1f")
+    proc_setpoint_c  = dual_float("Process SP °C", "t_sp",   -10.0, 90.0, 30.0, 0.1, fmt="%.1f")
+    loop_volume_l    = dual_float("Loop Volume L (process)", "loop_L", 1.0, 5000.0, 50.0, 1.0, fmt="%.0f")
+
+    st.subheader("Cooling (Chiller)")
+    chiller_sp_c     = dual_float("Chiller SP °C (HTF when cooling)", "t_chiller", -10.0, 40.0, 20.0, 0.1, fmt="%.1f")
+
+    st.subheader("Heating (TCU)")
+    heater_max_kw        = dual_float("Heater Max kW", "kw_heater", 0.0, 200.0, 6.0, 0.1, fmt="%.1f")
+    htf_target_supply_c  = dual_float("HTF Target Supply °C (to HX)", "t_htf_sp", 5.0, 90.0, 45.0, 0.1, fmt="%.1f")
+
+with col3:
+    st.subheader("Materials / Fouling / Margin")
+    wall_mat = st.selectbox("Wall k (W/mK)", list(WALL_K.keys()), index=0)
+    fouling_inner = dual_float("Foul Inner m²K/W", "f_i", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
+    fouling_outer = dual_float("Foul Outer m²K/W", "f_o", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
+    length_margin = dual_float("Length Margin (×)", "len_m", 0.0, 0.6, 0.15, 0.01, fmt="%.2f")
+
+st.divider()
+
+# ---------------- Run compute + show ----------------
+html, notes = compute(
+    n_machines, heat_per_machine_kw, override_total_kw,
+    inner_size, outer_size,
+    proc_flow_lph, htf_flow_lph,
+    proc_current_c, proc_setpoint_c, loop_volume_l,
+    chiller_sp_c,
+    heater_max_kw, htf_target_supply_c,
+    wall_mat, fouling_inner, fouling_outer, length_margin
+)
+
+if html is None:
+    st.error(notes[0] if notes else "Invalid geometry.")
+else:
+    st.markdown(html, unsafe_allow_html=True)
+    if notes:
+        st.markdown("**Notes**")
+        for n in notes:
+            st.markdown(f"- {n}")
