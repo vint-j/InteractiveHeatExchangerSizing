@@ -1,6 +1,6 @@
 # Double-Pipe Heat Exchanger + TCU (Chiller + Heater) Interactive App
 
-<img width="2441" height="1050" alt="image" src="https://github.com/user-attachments/assets/3a513c53-b4e7-4776-ace4-ed3b14867533" />
+<img width="2396" height="1042" alt="image" src="https://github.com/user-attachments/assets/154e2902-fdb9-45fc-a138-ecb15a4c1c20" />
 
 
 An interactive **Streamlit** app for sizing and simulating a double-pipe heat exchanger with a temperature control unit (TCU).  
