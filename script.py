@@ -1,7 +1,8 @@
 # hx_tcu_app.py
 # Double-Pipe HX + TCU (Chiller for Cooling, Heater for Heating) — HTF naming, dynamic time-to-SP
 # Streamlit app version with synced sliders + type-in fields (no session-state warnings)
-# Adds ambient heat gain/loss via tank + pipeline areas, pipeline lagging (area reduction)
+# Ambient gains/losses via tank + pipeline areas, pipeline lagging (area reduction).
+# Pipe dropdowns updated to EN10255 (BS1387) Medium/Heavy thicknesses (inches retained for nominal size).
 
 import math
 import streamlit as st
@@ -9,21 +10,57 @@ import streamlit as st
 # ---------------- Page setup ----------------
 st.set_page_config(page_title="Double-Pipe HX + TCU (HTF) — Interactive", layout="wide")
 
-# ---------- Pipe data (ASME B36.10 Sch 40); dimensions in meters ----------
-PIPES_SCH40 = {
-    '1.5"': {'OD': 0.0483, 'ID': 0.0409},
-    '2"':   {'OD': 0.0603, 'ID': 0.0525},
-    '2.5"': {'OD': 0.0730, 'ID': 0.0627},
-    '3"':   {'OD': 0.0889, 'ID': 0.0779},
-    '4"':   {'OD': 0.1143, 'ID': 0.1023},
+# ---------- EN10255 (BS1387) nominal sizes (inch labels), OD (mm), thickness (mm) ----------
+# Thickness values taken from the provided table. If a grade is not available for a size, "Heavy" falls back to "Medium".
+# (If a range were given for thickness, you would use its average; the table gives single values.)
+EN10255_DATA = {
+    '1/8"':  {'OD_mm': 10.2,  't_medium_mm': 2.00, 't_heavy_mm': None},
+    '1/4"':  {'OD_mm': 13.5,  't_medium_mm': 2.35, 't_heavy_mm': 2.90},
+    '3/8"':  {'OD_mm': 17.2,  't_medium_mm': 2.35, 't_heavy_mm': 2.90},
+    '1/2"':  {'OD_mm': 21.3,  't_medium_mm': 2.65, 't_heavy_mm': 3.25},
+    '3/4"':  {'OD_mm': 26.9,  't_medium_mm': 2.65, 't_heavy_mm': 3.25},
+    '1"':    {'OD_mm': 33.7,  't_medium_mm': 3.25, 't_heavy_mm': 4.05},
+    '1.25"': {'OD_mm': 42.4,  't_medium_mm': 3.25, 't_heavy_mm': 4.05},
+    '1.5"':  {'OD_mm': 48.3,  't_medium_mm': 3.25, 't_heavy_mm': 4.05},
+    '2"':    {'OD_mm': 60.3,  't_medium_mm': 3.65, 't_heavy_mm': 4.50},
+    '2.5"':  {'OD_mm': 76.1,  't_medium_mm': 3.65, 't_heavy_mm': 4.50},
+    '3"':    {'OD_mm': 88.9,  't_medium_mm': 4.05, 't_heavy_mm': 4.85},
+    '4"':    {'OD_mm': 114.3, 't_medium_mm': 4.50, 't_heavy_mm': 5.40},
+    '5"':    {'OD_mm': 139.7, 't_medium_mm': 4.85, 't_heavy_mm': 5.40},
+    '6"':    {'OD_mm': 165.1, 't_medium_mm': 4.85, 't_heavy_mm': 5.40},
 }
 
-# ---------- Wall thermal conductivities (W/m·K) ----------
-WALL_K = {
-    'Stainless steel': 16.0,
-    'Carbon steel':   45.0,
-    'Copper':        385.0,
-}
+NPS_ORDER = ['1/8"', '1/4"', '3/8"', '1/2"', '3/4"', '1"', '1.25"', '1.5"', '2"', '2.5"', '3"', '4"', '5"', '6"']
+
+def en10255_dims(nps: str, series: str):
+    """Return dict with OD, ID (meters) for a given nominal size and series ('Medium' or 'Heavy').
+       If requested Heavy thickness is not available, falls back to Medium and flags 'fallback'."""
+    d = EN10255_DATA[nps]
+    t_med = d['t_medium_mm']
+    t_heavy = d.get('t_heavy_mm')
+    fallback = False
+    if series == "Heavy":
+        if t_heavy is None:
+            t = t_med
+            fallback = True
+            eff_series = "Medium"
+        else:
+            t = t_heavy
+            eff_series = "Heavy"
+    else:
+        t = t_med
+        eff_series = "Medium"
+
+    OD_m = d['OD_mm'] / 1000.0
+    ID_m = max(0.0, (d['OD_mm'] - 2.0 * t) / 1000.0)
+    return {
+        "label": nps,
+        "series": eff_series,
+        "OD": OD_m,
+        "ID": ID_m,
+        "t_mm": t,
+        "fallback": fallback
+    }
 
 # ---------- Water-like properties (~25–30 °C, edit if needed) ----------
 rho = 997.0       # kg/m^3
@@ -178,8 +215,8 @@ def simulate_time_to_sp(T0, Tsp, UA, Ch_proc, Cc_htf, Q_machines_W,
 def compute(
     # machine heat
     n_machines, heat_per_machine_kw, override_total_kw,
-    # geometry
-    inner_size, outer_size,
+    # pipe selections (already resolved to dimensions)
+    inner_pipe, outer_pipe,
     # flows
     proc_flow_lph, htf_flow_lph,
     # process temps (current & setpoint) and inventory
@@ -199,11 +236,14 @@ def compute(
     Q_design_W = Q_design_kw * 1000.0
     Q_machines_W = Q_machines_kw * 1000.0
 
-    # ---- geometry ----
-    inner = PIPES_SCH40[inner_size]; outer = PIPES_SCH40[outer_size]
-    Di, Do = inner['ID'], inner['OD']; Do_shell_ID = outer['ID']
+    # ---- geometry from selected pipes ----
+    Di = inner_pipe['ID']
+    Do = inner_pipe['OD']
+    Do_shell_ID = outer_pipe['ID']  # shell ID is the inner diameter of the outer pipe
+
     if Do_shell_ID <= Do:
-        return None, ["ERROR: Outer pipe ID must exceed inner OD. Choose a larger outer NPS."]
+        return None, ["ERROR: Outer pipe ID must exceed inner pipe OD. Choose a larger outer NPS and/or heavier series."]
+
     Ai = math.pi * (Di**2) / 4.0
     Ao_per_m = math.pi * Do
     Aa, Dh = annulus_area_id(Do_shell_ID, Do)
@@ -238,6 +278,12 @@ def compute(
     h_o = Nu_h * k / Dh if Dh > 0 else 0.0
 
     # ---- overall U (outer-area basis) ----
+    # Wall conductivity for inner pipe only (thin-wall log term). Outer shell wall not explicitly modeled; effect is in h_o.
+    WALL_K = {
+        'Stainless steel': 16.0,
+        'Carbon steel':   45.0,
+        'Copper':        385.0,
+    }
     k_wall = WALL_K[wall_mat]
     R_i  = (Do / (Di * h_i)) if (Di > 0 and h_i > 0) else float('inf')
     R_w  = (Do * math.log(Do / Di)) / (2.0 * k_wall) if (Di > 0 and Do > 0) else float('inf')
@@ -295,6 +341,11 @@ def compute(
 
     # ---- notes ----
     notes = []
+    if inner_pipe.get('fallback'):
+        notes.append(f'Heavy series not listed for {inner_pipe["label"]}; used Medium thickness {inner_pipe["t_mm"]:.2f} mm.')
+    if outer_pipe.get('fallback'):
+        notes.append(f'Heavy series not listed for {outer_pipe["label"]}; used Medium thickness {outer_pipe["t_mm"]:.2f} mm.')
+
     if Re_p < 4000: notes.append(f"Process Re = {Re_p:,.0f} (transitional/laminar) → lower h_i; expect longer length.")
     if Re_h < 4000: notes.append(f"HTF annulus Re = {Re_h:,.0f} (transitional/laminar) → lower h_o; consider more HTF flow.")
     if DTlm != DTlm: notes.append("LMTD non-physical for sizing; check chiller SP vs process SP.")
@@ -317,10 +368,11 @@ def compute(
     <b>Inputs</b><br>
     • Machines: {n_machines} × {heat_per_machine_kw:.2f} kW (override={override_total_kw:.2f} kW) → Design Q = {Q_design_kw:.2f} kW<br>
     • Process flow = {proc_flow_lph:,.0f} L/h • HTF flow (annulus) = {htf_flow_lph:,.0f} L/h<br>
-    • Process now = {proc_current_c:.2f} °C • Process SP = {proc_setpoint_c:.2f} °C • Loop volume (process) = {loop_volume_l:.1f} L<br>
+    • Process now = {proc_current_c:.2f} °C • Process SP = {proc_setpoint_c:.2f} °C • Loop volume = {loop_volume_l:.1f} L<br>
     • Chiller SP = {chiller_sp_c:.2f} °C • Heater max = {heater_max_kw:.2f} kW • HTF target supply = {htf_target_supply_c:.2f} °C<br>
-    • Inner pipe = {inner_size} (ID={Di*1e3:.1f} mm, OD={Do*1e3:.1f} mm) • Outer (shell) = {outer_size} (ID={Do_shell_ID*1e3:.1f} mm)<br>
-    • Wall = {wall_mat} (k={WALL_K[wall_mat]:.1f} W/mK) • Fouling inner={fouling_inner:.1e} outer={fouling_outer:.1e} m²K/W • Length margin = {length_margin*100:.0f}%<br>
+    • Inner pipe = {inner_pipe['label']} ({inner_pipe['series']})  ID={inner_pipe['ID']*1e3:.1f} mm, OD={inner_pipe['OD']*1e3:.1f} mm, t={inner_pipe['t_mm']:.2f} mm<br>
+    • Outer (shell) = {outer_pipe['label']} ({outer_pipe['series']})  ID={outer_pipe['ID']*1e3:.1f} mm, OD={outer_pipe['OD']*1e3:.1f} mm, t={outer_pipe['t_mm']:.2f} mm<br>
+    • Wall (inner pipe) = {wall_mat} (k={WALL_K[wall_mat]:.1f} W/mK) • Fouling inner={fouling_inner:.1e} outer={fouling_outer:.1e} m²K/W • Length margin = {length_margin*100:.0f}%<br>
     • Ambient = {ambient_c:.2f} °C • U to ambient = {Uamb_W_m2K:.1f} W/m²K<br>
     • Pipeline length = {pipe_length_m:.2f} m → A_pipe(raw, ID-basis) = {A_pipe_raw:.3f} m² → A_pipe(effective) = {A_pipe_eff:.3f} m²<br>
     • Tank heat-transfer area = {tank_area_m2:.3f} m² • Total ambient exchange area = <b>{A_amb_total:.3f} m²</b><br><br>
@@ -389,11 +441,11 @@ st.markdown("### Double-Pipe HX with TCU (Chiller for Cooling, Heater for Heatin
 
 with st.expander("Notes on assumptions", expanded=False):
     st.markdown(
-        "- Fouling adds to total thermal resistance; set 0 for 'ideal'.\n"
-        "- Heating if current < setpoint; cooling if current > setpoint.\n"
-        "- Cooling capacity limits HX sizing; heater limited by Max kW.\n"
+        "- EN10255 dimensions used for pipe OD and wall thickness; ID computed as OD − 2·t.\n"
         "- Ambient gain/loss modeled as Q = U*A*(T_amb − T_proc).\n"
         "- Pipeline lagging reduces **pipeline** area only; tank area unaffected.\n"
+        "- Heating if current < setpoint; cooling if current > setpoint.\n"
+        "- Cooling capacity limits HX sizing; heater limited by Max kW.\n"
         "- Time-to-SP integrates net duty over total loop volume."
     )
 
@@ -405,9 +457,20 @@ with col1:
     heat_per_machine_kw = dual_float("kW per Mill", "kw_per", 0.00, 2.00, 0.33, 0.01, fmt="%.2f")
     override_total_kw   = dual_float("Override Total kW", "kw_override", 0.0, 20.0, 0.0, 0.1, fmt="%.1f")
 
-    st.subheader("Geometry")
-    inner_size = st.selectbox("Inner NPS", list(PIPES_SCH40.keys()), index=1)
-    outer_size = st.selectbox("Outer NPS", list(PIPES_SCH40.keys()), index=3)
+    st.subheader("Geometry (EN10255)")
+    inner_size = st.selectbox("Inner NPS", NPS_ORDER, index=NPS_ORDER.index('2"'))
+    inner_series = st.selectbox("Inner series", ["Medium", "Heavy"], index=0)
+    outer_size = st.selectbox("Outer NPS (shell)", NPS_ORDER, index=NPS_ORDER.index('3"'))
+    outer_series = st.selectbox("Outer series", ["Medium", "Heavy"], index=0)
+
+    # Resolve selections to dimensions
+    inner_pipe = en10255_dims(inner_size, inner_series)
+    outer_pipe = en10255_dims(outer_size, outer_series)
+
+    st.caption(
+        f"Inner: ID {inner_pipe['ID']*1e3:.1f} mm, OD {inner_pipe['OD']*1e3:.1f} mm, t {inner_pipe['t_mm']:.2f} mm | "
+        f"Outer(shell): ID {outer_pipe['ID']*1e3:.1f} mm, OD {outer_pipe['OD']*1e3:.1f} mm, t {outer_pipe['t_mm']:.2f} mm"
+    )
 
     st.subheader("Flows")
     proc_flow_lph = dual_int("Process L/h", "proc_lph", 200, 30000, 3420, 10)
@@ -428,7 +491,7 @@ with col2:
 
 with col3:
     st.subheader("Materials / Fouling / Margin")
-    wall_mat = st.selectbox("Wall k (W/mK)", list(WALL_K.keys()), index=0)
+    wall_mat = st.selectbox("Wall k (W/mK)", ["Stainless steel", "Carbon steel", "Copper"], index=1)
     fouling_inner = dual_float("Foul Inner m²K/W", "f_i", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
     fouling_outer = dual_float("Foul Outer m²K/W", "f_o", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
     length_margin = dual_float("Length Margin (×)", "len_m", 0.0, 0.6, 0.15, 0.01, fmt="%.2f")
@@ -445,7 +508,7 @@ st.divider()
 # ---------------- Run compute + show ----------------
 html, notes = compute(
     n_machines, heat_per_machine_kw, override_total_kw,
-    inner_size, outer_size,
+    inner_pipe, outer_pipe,
     proc_flow_lph, htf_flow_lph,
     proc_current_c, proc_setpoint_c, loop_volume_l,
     chiller_sp_c,
