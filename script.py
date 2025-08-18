@@ -1,6 +1,7 @@
 # hx_tcu_app.py
 # Double-Pipe HX + TCU (Chiller for Cooling, Heater for Heating) — HTF naming, dynamic time-to-SP
 # Streamlit app version with synced sliders + type-in fields (no session-state warnings)
+# Adds ambient heat gain/loss via tank + pipeline areas, pipeline lagging (area reduction)
 
 import math
 import streamlit as st
@@ -109,14 +110,17 @@ def solve_htf_supply_with_heater_limit(UA, T_proc_in, Ch_proc, Cc_htf, heater_ma
         if abs(hi-lo) < 1e-3: break
     return lo
 
-# ---------- dynamic time-to-setpoint (new) ----------
+# ---------- dynamic time-to-setpoint (with ambient) ----------
 def simulate_time_to_sp(T0, Tsp, UA, Ch_proc, Cc_htf, Q_machines_W,
                         chiller_sp_c, heater_max_W, htf_target_supply_c,
-                        m_process, dt_s=0.5, max_hours=24.0):
+                        m_process, Uamb, A_amb_total, T_amb,
+                        dt_s=0.5, max_hours=24.0):
     """
-    integrate dT/dt = (Q_machines + Q_HX(T)) / (m*cp) with mode switching.
+    integrate dT/dt = (Q_machines + Q_HX(T) + Q_amb(T)) / (m*cp) with mode switching.
     - cooling: HTF supply = chiller_sp_c (heater off)
     - heating: heater raises HTF up to target, capped by heater_max_W
+    - ambient: Q_amb = Uamb * A_amb_total * (T_amb - T)
+      (positive heats process; negative cools it)
     returns (t_sec, reached_bool, avg_net_W)
     """
     T = float(T0)
@@ -144,7 +148,8 @@ def simulate_time_to_sp(T0, Tsp, UA, Ch_proc, Cc_htf, Q_machines_W,
             )
 
         Q_hx = hx_q_to_process(UA, T, T_htf_supply, Ch_proc, Cc_htf)
-        Q_net = Q_machines_W + Q_hx
+        Q_amb = Uamb * A_amb_total * (T_amb - T)  # + heats, − cools
+        Q_net = Q_machines_W + Q_hx + Q_amb
         E_net += Q_net * dt_s
 
         # forward-euler step
@@ -184,7 +189,9 @@ def compute(
     # heating path (TCU heater)
     heater_max_kw, htf_target_supply_c,
     # materials/fouling/margin
-    wall_mat, fouling_inner, fouling_outer, length_margin
+    wall_mat, fouling_inner, fouling_outer, length_margin,
+    # ambient + surfaces
+    ambient_c, pipe_length_m, tank_area_m2, pipe_lagging_pct, Uamb_W_m2K
 ):
     # ---- machine duty ----
     Q_machines_kw = n_machines * heat_per_machine_kw
@@ -201,36 +208,43 @@ def compute(
     Ao_per_m = math.pi * Do
     Aa, Dh = annulus_area_id(Do_shell_ID, Do)
 
+    # ---- ambient surfaces ----
+    # Pipeline exchange area based on INNER DIAMETER (as requested): A = π * Di * L
+    A_pipe_raw = max(0.0, math.pi * Di * max(0.0, pipe_length_m))
+    damp = max(0.0, min(100.0, pipe_lagging_pct)) / 100.0
+    A_pipe_eff = A_pipe_raw * (1.0 - damp)   # apply lagging to pipeline only
+    A_amb_total = A_pipe_eff + max(0.0, tank_area_m2)
+
     # ---- flows & capacity rates ----
     # process
     qp_m3s = proc_flow_lph / 3600.0 / 1000.0
     mdot_p = rho * qp_m3s
-    vp = qp_m3s / Ai
+    vp = qp_m3s / Ai if Ai > 0 else 0.0
     Ch_proc = mdot_p * cp
 
     # HTF
     qh_m3s = htf_flow_lph / 3600.0 / 1000.0
     mdot_htf = rho * qh_m3s
-    vh = qh_m3s / Aa
+    vh = qh_m3s / Aa if Aa > 0 else 0.0
     Cc_htf = mdot_htf * cp
 
     # ---- films ----
-    Re_p = rho * vp * Di / mu
+    Re_p = rho * vp * Di / mu if Di > 0 else 0.0
     Nu_p = d_belt_nusselt(Re_p, Pr, heating=False) if Re_p >= 2300 else laminar_nusselt_circular()
-    h_i = Nu_p * k / Di
+    h_i = Nu_p * k / Di if Di > 0 else 0.0
 
-    Re_h = rho * vh * Dh / mu
+    Re_h = rho * vh * Dh / mu if Dh > 0 else 0.0
     Nu_h = d_belt_nusselt(Re_h, Pr, heating=True) if Re_h >= 2300 else laminar_nusselt_circular()
-    h_o = Nu_h * k / Dh
+    h_o = Nu_h * k / Dh if Dh > 0 else 0.0
 
     # ---- overall U (outer-area basis) ----
     k_wall = WALL_K[wall_mat]
-    R_i  = (Do / (Di * h_i))
-    R_w  = (Do * math.log(Do / Di)) / (2.0 * k_wall)
+    R_i  = (Do / (Di * h_i)) if (Di > 0 and h_i > 0) else float('inf')
+    R_w  = (Do * math.log(Do / Di)) / (2.0 * k_wall) if (Di > 0 and Do > 0) else float('inf')
     R_fi = fouling_inner
     R_fo = fouling_outer
-    R_o  = 1.0 / h_o
-    Uo = 1.0 / (R_i + R_w + R_fi + R_fo + R_o)
+    R_o  = 1.0 / h_o if h_o > 0 else float('inf')
+    Uo = 1.0 / (R_i + R_w + R_fi + R_fo + R_o) if all(x != float('inf') for x in [R_i, R_w, R_o]) else 0.0
 
     # ---- size HX for cooling at setpoint with chiller SP ----
     Th_in = proc_setpoint_c
@@ -245,19 +259,20 @@ def compute(
     DT2 = Th_out - T_htf_in_cold
     DTlm = lmtd(DT1, DT2)
 
-    A_req = Q_design_W / (Uo * DTlm) if DTlm > 0 else float('nan')
+    A_req = Q_design_W / (Uo * DTlm) if (DTlm > 0 and Uo > 0) else float('nan')
     L_req = A_req / Ao_per_m if A_req == A_req else float('nan')
     L_req_m = L_req * (1.0 + length_margin) if L_req == L_req else float('nan')
     V_annulus = Aa * L_req_m if L_req_m == L_req_m else float('nan')
     UA_installed = Uo * Ao_per_m * L_req_m if L_req_m == L_req_m else 0.0
 
-    # ---- dynamic time-to-SP (new) ----
+    # ---- dynamic time-to-SP (with ambient) ----
     M_loop = rho * (loop_volume_l / 1000.0)  # kg
     heater_max_W = max(0.0, heater_max_kw * 1000.0)
     t_sec, reached, Qnet_avg = simulate_time_to_sp(
         proc_current_c, proc_setpoint_c, UA_installed, Ch_proc, Cc_htf,
         Q_machines_W, chiller_sp_c, heater_max_W, htf_target_supply_c,
-        M_loop, dt_s=0.5, max_hours=24.0
+        M_loop, Uamb_W_m2K, A_amb_total, ambient_c,
+        dt_s=0.5, max_hours=24.0
     )
 
     # ---- mode & instantaneous displays (for context) ----
@@ -276,6 +291,7 @@ def compute(
         heater_use_W = min(heater_use_W, heater_max_W)
 
     Q_hx_now_W = hx_q_to_process(UA_installed, proc_current_c, T_htf_supply_eff, Ch_proc, Cc_htf)
+    Q_amb_now_W = Uamb_W_m2K * A_amb_total * (ambient_c - proc_current_c)
 
     # ---- notes ----
     notes = []
@@ -286,6 +302,8 @@ def compute(
         notes.append("Heater at limit now; supply may be below target.")
     if UA_installed <= 0: notes.append("Installed UA is zero/NaN (sizing invalid).")
     if not reached: notes.append("With current settings the loop cannot converge to SP (net power pushes the wrong way or is ~zero).")
+    if A_pipe_raw > 0 and damp > 0:
+        notes.append(f"Pipeline lagging reduces pipe area by {pipe_lagging_pct:.0f}% (effective A_pipe = {A_pipe_eff:.3f} m²).")
 
     # ---- helpers ----
     def fmt_time(s):
@@ -300,10 +318,12 @@ def compute(
     • Machines: {n_machines} × {heat_per_machine_kw:.2f} kW (override={override_total_kw:.2f} kW) → Design Q = {Q_design_kw:.2f} kW<br>
     • Process flow = {proc_flow_lph:,.0f} L/h • HTF flow (annulus) = {htf_flow_lph:,.0f} L/h<br>
     • Process now = {proc_current_c:.2f} °C • Process SP = {proc_setpoint_c:.2f} °C • Loop volume (process) = {loop_volume_l:.1f} L<br>
-    • Chiller SP (cooling) = {chiller_sp_c:.2f} °C • Heater max = {heater_max_kw:.2f} kW • HTF target supply = {htf_target_supply_c:.2f} °C<br>
-    • Inner pipe = {inner_size} (ID={PIPES_SCH40[inner_size]['ID']*1e3:.1f} mm, OD={PIPES_SCH40[inner_size]['OD']*1e3:.1f} mm)
-      • Outer (shell) = {outer_size} (ID={PIPES_SCH40[outer_size]['ID']*1e3:.1f} mm)<br>
-    • Wall = {wall_mat} (k={WALL_K[wall_mat]:.1f} W/mK) • Fouling inner={fouling_inner:.1e} outer={fouling_outer:.1e} m²K/W • Length margin = {length_margin*100:.0f}%<br><br>
+    • Chiller SP = {chiller_sp_c:.2f} °C • Heater max = {heater_max_kw:.2f} kW • HTF target supply = {htf_target_supply_c:.2f} °C<br>
+    • Inner pipe = {inner_size} (ID={Di*1e3:.1f} mm, OD={Do*1e3:.1f} mm) • Outer (shell) = {outer_size} (ID={Do_shell_ID*1e3:.1f} mm)<br>
+    • Wall = {wall_mat} (k={WALL_K[wall_mat]:.1f} W/mK) • Fouling inner={fouling_inner:.1e} outer={fouling_outer:.1e} m²K/W • Length margin = {length_margin*100:.0f}%<br>
+    • Ambient = {ambient_c:.2f} °C • U to ambient = {Uamb_W_m2K:.1f} W/m²K<br>
+    • Pipeline length = {pipe_length_m:.2f} m → A_pipe(raw, ID-basis) = {A_pipe_raw:.3f} m² → A_pipe(effective) = {A_pipe_eff:.3f} m²<br>
+    • Tank heat-transfer area = {tank_area_m2:.3f} m² • Total ambient exchange area = <b>{A_amb_total:.3f} m²</b><br><br>
 
     <b>Cooling HX sizing @ SP (chiller SP as cold inlet)</b><br>
     • LMTD = {DTlm:.3f} K  (ΔT1={DT1:.3f}, ΔT2={DT2:.3f}) • U_o={Uo:,.0f} W/m²K<br>
@@ -312,9 +332,10 @@ def compute(
 
     <b>Now</b><br>
     • Mode = <b>{'HEATING' if proc_current_c < proc_setpoint_c else 'COOLING'}</b> • HTF supply = {T_htf_supply_eff:.2f} °C • Heater use ≈ {heater_use_W/1000.0:.2f} kW<br>
-    • HX heat to process now ≈ {Q_hx_now_W/1000.0:.2f} kW (sign + heats / − cools)<br><br>
+    • HX heat to process now ≈ {Q_hx_now_W/1000.0:.2f} kW (sign + heats / − cools)<br>
+    • Ambient heat to process now ≈ {Q_amb_now_W/1000.0:.2f} kW (positive = heats, negative = cools)<br><br>
 
-    <b>Dynamic time to SP (this fix)</b><br>
+    <b>Dynamic time to SP</b><br>
     • Estimated time = <b>{fmt_time(t_sec)}</b> • Avg net to process ≈ {Qnet_avg/1000.0:.2f} kW (sign + heats / − cools)<br>
     </div>
     """
@@ -371,6 +392,8 @@ with st.expander("Notes on assumptions", expanded=False):
         "- Fouling adds to total thermal resistance; set 0 for 'ideal'.\n"
         "- Heating if current < setpoint; cooling if current > setpoint.\n"
         "- Cooling capacity limits HX sizing; heater limited by Max kW.\n"
+        "- Ambient gain/loss modeled as Q = U*A*(T_amb − T_proc).\n"
+        "- Pipeline lagging reduces **pipeline** area only; tank area unaffected.\n"
         "- Time-to-SP integrates net duty over total loop volume."
     )
 
@@ -410,6 +433,13 @@ with col3:
     fouling_outer = dual_float("Foul Outer m²K/W", "f_o", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
     length_margin = dual_float("Length Margin (×)", "len_m", 0.0, 0.6, 0.15, 0.01, fmt="%.2f")
 
+    st.subheader("Ambient & Surfaces")
+    ambient_c = dual_float("Ambient Air °C", "t_amb", -20.0, 50.0, 20.0, 0.1, fmt="%.1f")
+    Uamb_W_m2K = dual_float("Overall U to Ambient (W/m²·K)", "u_amb", 2.0, 50.0, 8.0, 0.5, fmt="%.1f")
+    pipe_length_m = dual_float("Pipeline Length (m)", "L_pipe", 0.0, 500.0, 10.0, 0.5, fmt="%.1f")
+    tank_area_m2 = dual_float("Tank Heat-Transfer Area (m²)", "A_tank", 0.0, 200.0, 2.0, 0.1, fmt="%.2f")
+    pipe_lagging_pct = dual_float("Pipeline Lagging (area reduction, %)", "lag_pct", 0.0, 100.0, 0.0, 1.0, fmt="%.0f")
+
 st.divider()
 
 # ---------------- Run compute + show ----------------
@@ -420,7 +450,8 @@ html, notes = compute(
     proc_current_c, proc_setpoint_c, loop_volume_l,
     chiller_sp_c,
     heater_max_kw, htf_target_supply_c,
-    wall_mat, fouling_inner, fouling_outer, length_margin
+    wall_mat, fouling_inner, fouling_outer, length_margin,
+    ambient_c, pipe_length_m, tank_area_m2, pipe_lagging_pct, Uamb_W_m2K
 )
 
 if html is None:
