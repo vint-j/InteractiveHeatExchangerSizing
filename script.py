@@ -3,9 +3,9 @@
 # Streamlit app with:
 # - EN10255 (BS1387) pipe sizing (Medium/Heavy) for inner/outer pipes
 # - Sliders + type-in fields (kept in sync)
-# - Ambient heat gain/loss via pipeline + tank areas
-# - Pipeline lagging (area reduction)
-# - Ambient section can be toggled ON/OFF (widgets disabled + ambient term zeroed)
+# - Ambient heat gain/loss via pipeline + tank areas (toggleable)
+# - Pipeline lagging (area reduction) — pipeline only
+# - Materials/Fouling and LENGTH MARGIN slider (restored)
 
 import math
 import streamlit as st
@@ -14,7 +14,7 @@ import streamlit as st
 st.set_page_config(page_title="Double-Pipe HX + TCU (HTF) — Interactive", layout="wide")
 
 # ---------- EN10255 (BS1387) nominal sizes (inch labels), OD (mm), thickness (mm) ----------
-# Heavy falls back to Medium when not listed.
+# If Heavy not listed in table, we fall back to Medium thickness.
 EN10255_DATA = {
     '1/8"':  {'OD_mm': 10.2,  't_medium_mm': 2.00, 't_heavy_mm': None},
     '1/4"':  {'OD_mm': 13.5,  't_medium_mm': 2.35, 't_heavy_mm': 2.90},
@@ -34,12 +34,11 @@ EN10255_DATA = {
 NPS_ORDER = ['1/8"', '1/4"', '3/8"', '1/2"', '3/4"', '1"', '1.25"', '1.5"', '2"', '2.5"', '3"', '4"', '5"', '6"']
 
 def en10255_dims(nps: str, series: str):
-    """Return dict with OD, ID (meters) and wall t (mm) for given NPS & series.
-       If Heavy not available, fall back to Medium and mark fallback=True."""
+    """Return dict with OD, ID (m) and wall thickness (mm) for given NPS & series.
+       If Heavy unavailable, fall back to Medium and flag fallback=True."""
     d = EN10255_DATA[nps]
     t_med = d['t_medium_mm']
     t_heavy = d.get('t_heavy_mm')
-
     fallback = False
     if series == "Heavy" and t_heavy is not None:
         t = t_heavy
@@ -51,7 +50,6 @@ def en10255_dims(nps: str, series: str):
     else:
         t = t_med
         eff_series = "Medium"
-
     OD_m = d['OD_mm'] / 1000.0
     ID_m = max(0.0, (d['OD_mm'] - 2.0 * t) / 1000.0)
     return {"label": nps, "series": eff_series, "OD": OD_m, "ID": ID_m, "t_mm": t, "fallback": fallback}
@@ -146,14 +144,15 @@ def solve_htf_supply_with_heater_limit(UA, T_proc_in, Ch_proc, Cc_htf, heater_ma
         if abs(hi-lo) < 1e-3: break
     return lo
 
-# ---------- dynamic time-to-setpoint (with ambient) ----------
+# ---------- dynamic time-to-setpoint (includes ambient) ----------
 def simulate_time_to_sp(T0, Tsp, UA, Ch_proc, Cc_htf, Q_machines_W,
                         chiller_sp_c, heater_max_W, htf_target_supply_c,
                         m_process, Uamb, A_amb_total, T_amb,
                         dt_s=0.5, max_hours=24.0):
     """
-    integrate dT/dt = (Q_machines + Q_HX(T) + Q_amb(T)) / (m*cp) with mode switching.
-    ambient term: Q_amb = Uamb * A_amb_total * (T_amb - T)
+    dT/dt = (Q_machines + Q_HX(T) + Q_amb(T)) / (m*cp)
+    with mode switching (heating vs cooling).
+    Q_amb = Uamb * A_amb_total * (T_amb - T)
     """
     T = float(T0)
     t = 0.0
@@ -177,7 +176,7 @@ def simulate_time_to_sp(T0, Tsp, UA, Ch_proc, Cc_htf, Q_machines_W,
             )
 
         Q_hx = hx_q_to_process(UA, T, T_htf_supply, Ch_proc, Cc_htf)
-        Q_amb = Uamb * A_amb_total * (T_amb - T)  # + heats, − cools
+        Q_amb = Uamb * A_amb_total * (T_amb - T)
         Q_net = Q_machines_W + Q_hx + Q_amb
         E_net += Q_net * dt_s
 
@@ -235,7 +234,7 @@ def compute(
     Aa, Dh = annulus_area_id(Do_shell_ID, Do)
 
     # ---- ambient surfaces ----
-    # Pipeline area (requested on inner diameter basis)
+    # Pipeline area (per spec: use **inner pipe diameter** as basis)
     A_pipe_raw = max(0.0, math.pi * Di * max(0.0, pipe_length_m))
     damp = max(0.0, min(100.0, pipe_lagging_pct)) / 100.0
     A_pipe_eff = A_pipe_raw * (1.0 - damp) if ambient_enabled else 0.0
@@ -337,7 +336,6 @@ def compute(
     else:
         notes.append("Ambient exchange disabled (U·A set to zero).")
 
-    # ---- helpers ----
     def fmt_time(s):
         if s == float('inf') or s != s: return "n/a"
         m, s = divmod(int(round(s)), 60); h, m = divmod(m, 60)
@@ -349,7 +347,6 @@ def compute(
                 if ambient_enabled else
                 "• Ambient exchange: <b>disabled</b> (U·A = 0)")
 
-    # ---- report ----
     html = f"""
     <div style="font-family:ui-monospace,Consolas,monospace; line-height:1.35">
     <b>Inputs</b><br>
@@ -359,7 +356,7 @@ def compute(
     • Chiller SP = {chiller_sp_c:.2f} °C • Heater max = {heater_max_kw:.2f} kW • HTF target supply = {htf_target_supply_c:.2f} °C<br>
     • Inner pipe = {inner_pipe['label']} ({inner_pipe['series']})  ID={inner_pipe['ID']*1e3:.1f} mm, OD={inner_pipe['OD']*1e3:.1f} mm, t={inner_pipe['t_mm']:.2f} mm<br>
     • Outer (shell) = {outer_pipe['label']} ({outer_pipe['series']})  ID={outer_pipe['ID']*1e3:.1f} mm, OD={outer_pipe['OD']*1e3:.1f} mm, t={outer_pipe['t_mm']:.2f} mm<br>
-    • Wall (inner pipe) = {wall_mat} (k={WALL_K[wall_mat]:.1f} W/mK) • Fouling inner={fouling_inner:.1e} outer={fouling_outer:.1e} m²K/W • Length margin = {length_margin*100:.0f}%<br>
+    • Wall (inner pipe) = {wall_mat} (k={WALL_K[wall_mat]:.1f} W/mK) • Fouling inner={fouling_inner:.1e} outer={fouling_outer:.1e} m²K/W • Length margin = <b>{length_margin*100:.0f}%</b><br>
     {amb_line}<br><br>
 
     <b>Cooling HX sizing @ SP (chiller SP as cold inlet)</b><br>
@@ -383,7 +380,6 @@ def _sync_from_num(key): st.session_state[f"{key}_sld"] = st.session_state[f"{ke
 def _sync_from_sld(key): st.session_state[f"{key}_num"] = st.session_state[f"{key}_sld"]
 
 def dual_float(label, key, min_value, max_value, default, step, fmt=None, help=None, disabled=False):
-    # initialize once
     if f"{key}_num" not in st.session_state:
         st.session_state[f"{key}_num"] = float(default)
         st.session_state[f"{key}_sld"] = float(default)
@@ -438,7 +434,8 @@ with st.expander("Notes on assumptions", expanded=False):
         "- Time-to-SP integrates net duty over total loop volume."
     )
 
-col1, col2, col3 = st.columns(3, gap="large")
+# Use four columns so Ambient is its own toggleable column and Margin slider is separate
+col1, col2, col3, col4 = st.columns(4, gap="large")
 
 with col1:
     st.subheader("Machine heat")
@@ -481,12 +478,18 @@ with col3:
     st.subheader("Ambient & Surfaces")
     ambient_enabled = st.checkbox("Enable ambient gains/losses", value=True)
     disabled_flag = not ambient_enabled
-
     ambient_c = dual_float("Ambient Air °C", "t_amb", -20.0, 50.0, 20.0, 0.1, fmt="%.1f", disabled=disabled_flag)
     Uamb_W_m2K = dual_float("Overall U to Ambient (W/m²·K)", "u_amb", 2.0, 50.0, 8.0, 0.5, fmt="%.1f", disabled=disabled_flag)
     pipe_length_m = dual_float("Pipeline Length (m)", "L_pipe", 0.0, 500.0, 10.0, 0.5, fmt="%.1f", disabled=disabled_flag)
     tank_area_m2 = dual_float("Tank Heat-Transfer Area (m²)", "A_tank", 0.0, 200.0, 2.0, 0.1, fmt="%.2f", disabled=disabled_flag)
     pipe_lagging_pct = dual_float("Pipeline Lagging (area reduction, %)", "lag_pct", 0.0, 100.0, 0.0, 1.0, fmt="%.0f", disabled=disabled_flag)
+
+with col4:
+    st.subheader("Materials / Fouling / Margin")
+    wall_mat = st.selectbox("Wall k (W/mK)", list(WALL_K.keys()), index=1)  # default Carbon steel
+    fouling_inner = dual_float("Foul Inner m²K/W", "f_i", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
+    fouling_outer = dual_float("Foul Outer m²K/W", "f_o", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
+    length_margin = dual_float("Length Margin (×)", "len_m", 0.0, 0.6, 0.15, 0.01, fmt="%.2f")  # <— restored
 
 st.divider()
 
@@ -497,29 +500,10 @@ html, notes = compute(
     proc_flow_lph, htf_flow_lph,
     proc_current_c, proc_setpoint_c, loop_volume_l,
     chiller_sp_c, heater_max_kw, htf_target_supply_c,
-    list(WALL_K.keys())[list(WALL_K.keys()).index('Carbon steel')],  # placeholder; we still select below
-    0.0, 0.0, 0.15,  # placeholders (overridden next lines) – kept for signature alignment if edited
+    wall_mat, fouling_inner, fouling_outer, length_margin,
     ambient_c, pipe_length_m, tank_area_m2, pipe_lagging_pct, Uamb_W_m2K,
     ambient_enabled
 )
-
-# The above placeholder call was accidental due to refactor; replace with correct call below:
-# (We keep it simple: call once correctly.)
-html, notes = compute(
-    n_machines, heat_per_machine_kw, override_total_kw,
-    inner_pipe, outer_pipe,
-    proc_flow_lph, htf_flow_lph,
-    proc_current_c, proc_setpoint_c, loop_volume_l,
-    chiller_sp_c, heater_max_kw, htf_target_supply_c,
-    st.session_state.get("wall_mat_sel", "Carbon steel") if False else "Carbon steel",
-    0.0, 0.0, 0.15,  # fouling_i, fouling_o, length_margin – if you need UI for these, add back as before
-    ambient_c, pipe_length_m, tank_area_m2, pipe_lagging_pct, Uamb_W_m2K,
-    ambient_enabled
-)
-
-# NOTE:
-# If you still want the Materials/Fouling/Margin UI block from previous version,
-# re-add that section and pass the chosen values into the compute() call above.
 
 if html is None:
     st.error(notes[0] if notes else "Invalid geometry.")
