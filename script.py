@@ -5,7 +5,8 @@
 # - Sliders + type-in fields (kept in sync)
 # - Ambient heat gain/loss via pipeline + tank areas (toggleable)
 # - Pipeline lagging (area reduction) — pipeline only
-# - Materials/Fouling and LENGTH MARGIN slider (restored)
+# - Materials/Fouling and LENGTH MARGIN slider
+# - NEW: Installed HX length OVERRIDE (if set, clamps UA used in all calcs; otherwise auto from design)
 
 import math
 import streamlit as st
@@ -14,7 +15,7 @@ import streamlit as st
 st.set_page_config(page_title="Double-Pipe HX + TCU (HTF) — Interactive", layout="wide")
 
 # ---------- EN10255 (BS1387) nominal sizes (inch labels), OD (mm), thickness (mm) ----------
-# If Heavy not listed in table, we fall back to Medium thickness.
+# If Heavy not listed, fall back to Medium thickness.
 EN10255_DATA = {
     '1/8"':  {'OD_mm': 10.2,  't_medium_mm': 2.00, 't_heavy_mm': None},
     '1/4"':  {'OD_mm': 13.5,  't_medium_mm': 2.35, 't_heavy_mm': 2.90},
@@ -151,7 +152,6 @@ def simulate_time_to_sp(T0, Tsp, UA, Ch_proc, Cc_htf, Q_machines_W,
                         dt_s=0.5, max_hours=24.0):
     """
     dT/dt = (Q_machines + Q_HX(T) + Q_amb(T)) / (m*cp)
-    with mode switching (heating vs cooling).
     Q_amb = Uamb * A_amb_total * (T_amb - T)
     """
     T = float(T0)
@@ -213,7 +213,9 @@ def compute(
     wall_mat, fouling_inner, fouling_outer, length_margin,
     # ambient + surfaces
     ambient_c, pipe_length_m, tank_area_m2, pipe_lagging_pct, Uamb_W_m2K,
-    ambient_enabled
+    ambient_enabled,
+    # NEW override for installed HX length (m). If None, auto from design.
+    hx_len_override_m=None
 ):
     # ---- machine duty ----
     Q_machines_kw = n_machines * heat_per_machine_kw
@@ -230,7 +232,7 @@ def compute(
         return None, ["ERROR: Outer pipe ID must exceed inner pipe OD. Choose a larger outer NPS and/or heavier series."]
 
     Ai = math.pi * (Di**2) / 4.0
-    Ao_per_m = math.pi * Do
+    Ao_per_m = math.pi * Do  # outer-area basis perimeter per meter
     Aa, Dh = annulus_area_id(Do_shell_ID, Do)
 
     # ---- ambient surfaces ----
@@ -270,7 +272,7 @@ def compute(
     R_o  = 1.0 / h_o if h_o > 0 else float('inf')
     Uo = 1.0 / (R_i + R_w + R_fi + R_fo + R_o) if all(x != float('inf') for x in [R_i, R_w, R_o]) else 0.0
 
-    # ---- size HX for cooling at setpoint with chiller SP ----
+    # ---- size HX for cooling at setpoint with chiller SP (design) ----
     Th_in = proc_setpoint_c
     dTp = Q_design_W / max(1e-9, Ch_proc)
     Th_out = Th_in - dTp
@@ -286,12 +288,30 @@ def compute(
     A_req = Q_design_W / (Uo * DTlm) if (DTlm > 0 and Uo > 0) else float('nan')
     L_req = A_req / Ao_per_m if A_req == A_req else float('nan')
     L_req_m = L_req * (1.0 + length_margin) if L_req == L_req else float('nan')
-    V_annulus = Aa * L_req_m if L_req_m == L_req_m else float('nan')
-    UA_installed = Uo * Ao_per_m * L_req_m if L_req_m == L_req_m else 0.0
+
+    # ---- choose installed length for ALL dynamics & "Now" calcs ----
+    # If override provided and valid, clamp to that. Else use auto (L_req with margin).
+    use_override = False
+    if hx_len_override_m is not None:
+        try:
+            L_installed = float(hx_len_override_m)
+            if not (L_installed == L_installed):  # NaN check
+                L_installed = L_req_m
+            else:
+                L_installed = max(0.0, L_installed)
+                use_override = True
+        except Exception:
+            L_installed = L_req_m
+    else:
+        L_installed = L_req_m
+
+    V_annulus = Aa * L_installed if (L_installed == L_installed) else float('nan')
+    UA_installed = Uo * Ao_per_m * L_installed if (L_installed == L_installed) else 0.0
 
     # ---- dynamic time-to-SP (with ambient) ----
     M_loop = rho * (loop_volume_l / 1000.0)  # kg
     heater_max_W = max(0.0, heater_max_kw * 1000.0)
+
     t_sec, reached, Qnet_avg = simulate_time_to_sp(
         proc_current_c, proc_setpoint_c, UA_installed, Ch_proc, Cc_htf,
         Q_machines_W, chiller_sp_c, heater_max_W, htf_target_supply_c,
@@ -335,6 +355,8 @@ def compute(
             notes.append(f"Pipeline lagging reduces pipe area by {pipe_lagging_pct:.0f}% (effective A_pipe = {A_pipe_eff:.3f} m²).")
     else:
         notes.append("Ambient exchange disabled (U·A set to zero).")
+    if use_override:
+        notes.append(f"HX length override in effect: L_installed = {L_installed:.2f} m (ignores design L_req).")
 
     def fmt_time(s):
         if s == float('inf') or s != s: return "n/a"
@@ -347,6 +369,7 @@ def compute(
                 if ambient_enabled else
                 "• Ambient exchange: <b>disabled</b> (U·A = 0)")
 
+    # Show both the design length and the installed (used) length
     html = f"""
     <div style="font-family:ui-monospace,Consolas,monospace; line-height:1.35">
     <b>Inputs</b><br>
@@ -361,8 +384,9 @@ def compute(
 
     <b>Cooling HX sizing @ SP (chiller SP as cold inlet)</b><br>
     • LMTD = {DTlm:.3f} K  (ΔT1={DT1:.3f}, ΔT2={DT2:.3f}) • U_o={Uo:,.0f} W/m²K<br>
-    • Area A = {A_req:.3f} m² • Length L = {L_req:.2f} m → with margin = <b>{L_req_m:.2f} m</b><br>
-    • Annulus hold-up ≈ {V_annulus*1e3 if V_annulus==V_annulus else float('nan'):.1f} L • Installed UA ≈ {UA_installed/1000.0:.2f} kW/K<br><br>
+    • Area A_req = {A_req:.3f} m² • Length L_req = {L_req:.2f} m • With margin = <b>{L_req_m:.2f} m</b><br>
+    • <b>Installed length used</b> = {L_installed:.2f} m • Annulus hold-up ≈ {V_annulus*1e3 if V_annulus==V_annulus else float('nan'):.1f} L<br>
+    • Installed UA ≈ {UA_installed/1000.0:.3f} kW/K<br><br>
 
     <b>Now</b><br>
     • Mode = <b>{'HEATING' if proc_current_c < proc_setpoint_c else 'COOLING'}</b> • HTF supply = {T_htf_supply_eff:.2f} °C • Heater use ≈ {heater_use_W/1000.0:.2f} kW<br>
@@ -421,6 +445,16 @@ def dual_int(label, key, min_value, max_value, default, step=1, help=None, disab
                   disabled=disabled)
     return int(st.session_state[f"{key}_num"])
 
+def _parse_float_or_none(txt: str):
+    if txt is None: return None
+    s = str(txt).strip()
+    if s == "": return None
+    try:
+        v = float(s)
+        return v
+    except Exception:
+        return None
+
 # ---------------- UI ----------------
 st.markdown("### Double-Pipe HX with TCU (Chiller for Cooling, Heater for Heating) — HTF")
 
@@ -431,10 +465,10 @@ with st.expander("Notes on assumptions", expanded=False):
         "- Pipeline lagging reduces **pipeline** area only; tank area unaffected.\n"
         "- Heating if current < setpoint; cooling if current > setpoint.\n"
         "- Cooling capacity limits HX sizing; heater limited by Max kW.\n"
-        "- Time-to-SP integrates net duty over total loop volume."
+        "- Time-to-SP integrates net duty over total loop volume.\n"
+        "- **HX length override** (if set) is used everywhere (UA fixed). Leave blank to auto-size from design."
     )
 
-# Use four columns so Ambient is its own toggleable column and Margin slider is separate
 col1, col2, col3, col4 = st.columns(4, gap="large")
 
 with col1:
@@ -489,7 +523,14 @@ with col4:
     wall_mat = st.selectbox("Wall k (W/mK)", list(WALL_K.keys()), index=1)  # default Carbon steel
     fouling_inner = dual_float("Foul Inner m²K/W", "f_i", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
     fouling_outer = dual_float("Foul Outer m²K/W", "f_o", 0.0, 3e-4, 0.0, 1e-5, fmt="%.5f")
-    length_margin = dual_float("Length Margin (×)", "len_m", 0.0, 0.6, 0.15, 0.01, fmt="%.2f")  # <— restored
+    length_margin = dual_float("Length Margin (×)", "len_m", 0.0, 0.6, 0.15, 0.01, fmt="%.2f")
+
+    st.subheader("HX installation settings")
+    hx_len_override_txt = st.text_input(
+        "HX installed length override (m) — leave blank for auto-size",
+        value="", placeholder="e.g., 6.0"
+    )
+    hx_len_override_m = _parse_float_or_none(hx_len_override_txt)
 
 st.divider()
 
@@ -502,7 +543,8 @@ html, notes = compute(
     chiller_sp_c, heater_max_kw, htf_target_supply_c,
     wall_mat, fouling_inner, fouling_outer, length_margin,
     ambient_c, pipe_length_m, tank_area_m2, pipe_lagging_pct, Uamb_W_m2K,
-    ambient_enabled
+    ambient_enabled,
+    hx_len_override_m=hx_len_override_m
 )
 
 if html is None:
